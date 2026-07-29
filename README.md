@@ -187,7 +187,9 @@ uv run uvicorn agent.server:app --reload --port 8080
 - `POST /run` — `{question, viewer, session_id?}` → `{answer, stamp, receipts[], session_id}`,
   the contract the React UI speaks.
 - `GET /.well-known/agent-card.json` — the auto-generated A2A agent card (from `to_a2a()`).
-- `GET /healthz`.
+- `GET /livez` — liveness check. Named `/livez` rather than the more common `/healthz`
+  because on Cloud Run's `*.run.app` domains, GFE (the edge in front of the container)
+  reserves `/healthz` for its own internal convention and never forwards it to the app.
 
 **Without a key**, the agent process will fail to make model calls — there is deliberately **no
 LLM fallback for figures** (spec §13.5): if the model is unreachable, the intent is an honest

@@ -111,13 +111,20 @@ async def run_endpoint(request: Request) -> JSONResponse:
     )
 
 
-async def healthz(request: Request) -> JSONResponse:
+async def livez(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
 app = to_a2a(root_agent, port=int(os.environ.get("PORT", 8080)))
 app.add_route("/run", run_endpoint, methods=["POST"])
-app.add_route("/healthz", healthz, methods=["GET"])
+# Named /livez, not /healthz: on Cloud Run's *.run.app domains, GFE (the
+# edge in front of the container) reserves /healthz for its own internal
+# health-checking convention and never forwards it to the app — it 404s
+# before reaching us regardless of what route we register. /livez isn't
+# reserved and reaches the container normally. Cloud Run's own container
+# probe is plain TCP here (no --startup-probe httpGet configured), so this
+# endpoint is purely for our own external observability, not deploy gating.
+app.add_route("/livez", livez, methods=["GET"])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[UI_ORIGIN],
