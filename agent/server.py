@@ -37,6 +37,19 @@ from governed.models import Stamp
 APP_NAME = "meridian_ci"
 UI_ORIGIN = os.environ.get("UI_ORIGIN", "http://localhost:5173")
 
+# Cloud Run serves every service under two valid URL formats simultaneously
+# — legacy hash-based (meridian-ui-<hash>-uc.a.run.app) and the newer
+# project-number-based one (meridian-ui-<project-number>.<region>.run.app)
+# — both resolve to the same revision. Pinning CORS to whichever single
+# string `gcloud run services describe` happened to report at deploy time
+# (UI_ORIGIN, above) silently breaks the other valid URL for any browser
+# that lands on it — confirmed live: curl calls worked throughout because
+# they never send an Origin header, while the deployed UI got "pipeline
+# data service is unavailable" because its actual origin didn't match the
+# CORS allowlist. This regex accepts either format for the meridian-ui
+# service specifically, without opening CORS to arbitrary origins.
+UI_ORIGIN_REGEX = r"^https://meridian-ui-[a-zA-Z0-9.-]+\.run\.app$"
+
 _session_service = InMemorySessionService()
 _runner = Runner(agent=root_agent, app_name=APP_NAME, session_service=_session_service)
 
@@ -128,6 +141,7 @@ app.add_route("/livez", livez, methods=["GET"])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[UI_ORIGIN],
+    allow_origin_regex=UI_ORIGIN_REGEX,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
