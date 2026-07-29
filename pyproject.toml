@@ -1,0 +1,31 @@
+[project]
+name = "meridian-agentic"
+version = "0.1.0"
+description = "Governed, agentic commercial intelligence over Q1 2026 sales pipeline data — ADK orchestrator on Claude, MCP-exposed governed tools, DuckDB core."
+requires-python = ">=3.12"
+dependencies = [
+    "a2a-sdk>=1.1.2",
+    "duckdb>=1.5.5",
+    "google-adk>=2.5.0",
+    "litellm>=1.94.0",
+    "mcp[cli]>=2.0.0",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

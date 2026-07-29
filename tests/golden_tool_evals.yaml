@@ -1,0 +1,79 @@
+# Tier A — governed-tool determinism gate (spec §12).
+# Hard deploy gate: no LLM, no network. Called directly against the MCP
+# tool surface (mcp_server/server.py) via test_tool_determinism.py.
+
+cases:
+  - name: enterprise_attainment
+    tool: get_segment_attainment
+    args: { segment: "Enterprise", viewer: "LEADERSHIP" }
+    expect_stamp: assumption
+    expect_value: { attainment_pct: 58.6, won: 2050000, quota: 3500000 }
+
+  - name: mid_market_attainment
+    tool: get_segment_attainment
+    args: { segment: "Mid-Market", viewer: "LEADERSHIP" }
+    expect_stamp: assumption
+    expect_value: { attainment_pct: 56.4, won: 1100000, quota: 1950000 }
+
+  - name: smb_attainment
+    tool: get_segment_attainment
+    args: { segment: "SMB", viewer: "LEADERSHIP" }
+    expect_stamp: assumption
+    expect_value: { attainment_pct: 58.5, won: 275000, quota: 470000 }
+
+  - name: reps_at_risk_default
+    tool: get_reps_at_risk
+    args: { viewer: "LEADERSHIP" }
+    expect_stamp: assumption
+    expect_value: { total_reps: 10, at_risk_count: 7 }
+
+  - name: pipeline_value_close_before_q1_end
+    tool: get_pipeline_value
+    args: { close_before: "2026-03-31", viewer: "LEADERSHIP" }
+    expect_stamp: assumption
+    expect_value: { pipeline_value: 1301000 }
+
+  - name: pipeline_value_unfiltered
+    tool: get_pipeline_value
+    args: { viewer: "LEADERSHIP" }
+    expect_stamp: verified
+    expect_value: { pipeline_value: 4311000 }
+
+  - name: ironbridge_refuses
+    tool: get_deal_reason
+    args: { account_name: "Ironbridge", viewer: "LEADERSHIP" }
+    expect_stamp: cannot_verify
+    expect_value: { found: true }
+
+  - name: fulcrum_verified_reason
+    tool: get_deal_reason
+    args: { account_name: "Fulcrum Enterprises", viewer: "LEADERSHIP" }
+    expect_stamp: verified
+    expect_value: { loss_reason: "Competitor - Salesforce" }
+
+  # ── Access scoping (INV-10) — same hard gate, deterministic, no LLM ───────
+
+  - name: scoped_rep_sees_only_own_contribution
+    tool: get_segment_attainment
+    args: { segment: "Enterprise", viewer: "REP-02" }
+    expect_stamp: assumption
+    expect_value: { won: 340000, quota: 850000, attainment_pct: 40.0 }
+    expect_not_value: { won: 2050000 }
+
+  - name: leadership_is_unrestricted
+    tool: get_segment_attainment
+    args: { segment: "Enterprise", viewer: "LEADERSHIP" }
+    expect_stamp: assumption
+    expect_value: { won: 2050000, quota: 3500000 }
+
+  - name: unknown_viewer_fails_closed
+    tool: get_segment_attainment
+    args: { segment: "Enterprise", viewer: "UNKNOWN" }
+    expect_stamp: cannot_verify
+    expect_value: {}
+
+  - name: blank_viewer_fails_closed
+    tool: get_pipeline_value
+    args: { viewer: "" }
+    expect_stamp: cannot_verify
+    expect_value: {}

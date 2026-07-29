@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node / UI
+ui/node_modules/
+ui/dist/
+ui/.vite/
+ui/tsconfig.tsbuildinfo
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

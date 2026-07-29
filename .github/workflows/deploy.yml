@@ -1,0 +1,276 @@
+# CI/CD for the 2-service demo topology (spec §16.1).
+#
+# Gate rule: Tier A green, or no deploy. Tier B (needs a live Claude call)
+# runs as its own job and blocks the agent-service deploy on failure.
+# Only the service(s) whose paths actually changed get rebuilt and
+# redeployed — a UI-only commit never rebuilds the agent image and vice
+# versa. Auth to GCP is keyless (Workload Identity Federation) — no JSON
+# keys in this public repo (spec §13.2).
+#
+# Repo configuration this workflow expects (Settings → Secrets/Variables):
+#   secrets:   ANTHROPIC_API_KEY, WIF_PROVIDER, WIF_SERVICE_ACCOUNT
+#   variables: GCP_PROJECT_ID, GCP_REGION, AR_REPO
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write # required for keyless WIF auth
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'governed/**'
+              - 'agent/**'
+              - 'mcp_server/**'
+              - 'tests/**'
+              - 'data/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/workflows/deploy.yml'
+            ui:
+              - 'ui/**'
+              - '.github/workflows/deploy.yml'
+
+  lint-and-tier-a:
+    name: Lint + Tier A (governed-tool determinism gate)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: ruff
+        run: uv run ruff check .
+
+      - name: Tier A — governed tier + MCP tool determinism (no LLM, no network)
+        run: >
+          uv run pytest tests/test_engine.py tests/test_gates.py
+          tests/test_tool_determinism.py -v
+
+  tier-b:
+    name: Tier B (orchestrator faithfulness gate)
+    runs-on: ubuntu-latest
+    needs: [changes, lint-and-tier-a]
+    if: needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      - name: Tier B — agent faithfulness (Ironbridge, refusals, access forwarding)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODEL_ID: anthropic/claude-haiku-4-5-20251001
+        run: uv run pytest tests/test_agent_faithfulness.py -v
+
+  ui-build:
+    name: Build UI bundle
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ui/package-lock.json
+      - run: npm install
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+
+  deploy-agent:
+    name: Deploy agent service
+    runs-on: ubuntu-latest
+    needs: [changes, lint-and-tier-a, tier-b]
+    if: >
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.python == 'true' &&
+      needs.lint-and-tier-a.result == 'success' &&
+      needs.tier-b.result == 'success'
+    outputs:
+      agent_url: ${{ steps.deploy.outputs.agent_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build + push agent image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/meridian-agent:${{ github.sha }}"
+          docker build -f agent/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "AGENT_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Current UI origin (if the UI is already deployed)
+        id: ui_origin
+        run: |
+          URL=$(gcloud run services describe meridian-ui \
+            --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+            --format 'value(status.url)' 2>/dev/null || true)
+          echo "url=${URL:-http://localhost:5173}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy agent service (co-located governed tools, §16.1)
+        id: deploy
+        run: |
+          gcloud run deploy meridian-agent \
+            --image "$AGENT_IMAGE" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --set-secrets ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest \
+            --set-env-vars UI_ORIGIN=${{ steps.ui_origin.outputs.url }},MODEL_ID=anthropic/claude-haiku-4-5-20251001 \
+            --min-instances 0 --max-instances 3 --memory 512Mi \
+            --allow-unauthenticated \
+            --quiet
+          AGENT_URL=$(gcloud run services describe meridian-agent \
+            --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+            --format 'value(status.url)')
+          echo "agent_url=$AGENT_URL" >> "$GITHUB_OUTPUT"
+
+  deploy-ui:
+    name: Deploy UI service
+    runs-on: ubuntu-latest
+    needs: [changes, ui-build, deploy-agent]
+    if: >
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.ui == 'true' &&
+      needs.ui-build.result == 'success' &&
+      (needs.deploy-agent.result == 'success' || needs.deploy-agent.result == 'skipped')
+    outputs:
+      ui_url: ${{ steps.deploy.outputs.ui_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Resolve agent URL
+        id: agent_url
+        run: |
+          URL="${{ needs.deploy-agent.outputs.agent_url }}"
+          if [ -z "$URL" ]; then
+            URL=$(gcloud run services describe meridian-agent \
+              --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+              --format 'value(status.url)')
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push UI image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.AR_REPO }}/meridian-ui:${{ github.sha }}"
+          docker build -f ui/Dockerfile --build-arg VITE_AGENT_URL="${{ steps.agent_url.outputs.url }}" -t "$IMAGE" ui
+          docker push "$IMAGE"
+          echo "UI_IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy UI (static, nginx-on-Cloud-Run)
+        id: deploy
+        run: |
+          gcloud run deploy meridian-ui \
+            --image "$UI_IMAGE" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --min-instances 0 --max-instances 3 --memory 256Mi \
+            --allow-unauthenticated \
+            --quiet
+          UI_URL=$(gcloud run services describe meridian-ui \
+            --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+            --format 'value(status.url)')
+          echo "ui_url=$UI_URL" >> "$GITHUB_OUTPUT"
+
+  sync-cors:
+    name: Sync agent CORS to the current UI origin
+    runs-on: ubuntu-latest
+    needs: [deploy-agent, deploy-ui]
+    if: >
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      (needs.deploy-agent.result == 'success' || needs.deploy-ui.result == 'success')
+    steps:
+      - id: auth
+        name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve current UI URL
+        id: ui_origin
+        run: |
+          URL="${{ needs.deploy-ui.outputs.ui_url }}"
+          if [ -z "$URL" ]; then
+            URL=$(gcloud run services describe meridian-ui \
+              --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+              --format 'value(status.url)' 2>/dev/null || true)
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Update agent CORS if it drifted
+        if: steps.ui_origin.outputs.url != ''
+        run: |
+          gcloud run services update meridian-agent \
+            --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+            --update-env-vars UI_ORIGIN=${{ steps.ui_origin.outputs.url }} \
+            --quiet
